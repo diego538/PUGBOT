@@ -1,4 +1,5 @@
-import requests
+import aiohttp
+import asyncio
 import csv
 import pandas as pd
 import numpy as np
@@ -7,16 +8,22 @@ from datetime import datetime
 KLINE_URL = "https://api.bybit.com/v5/market/kline?category=spot&symbol={}&interval={}"
 ORDERBOOK_URL = "https://api.bybit.com/v5/market/orderbook?category=spot&symbol={}&limit=50"
 
-# ======================
-# 1. Загрузка данных
-# ======================
-def load_kline(symbol, interval):
+# ----------------------
+# Асинхронная загрузка данных
+# ----------------------
+async def fetch_json(session, url):
     try:
-        r = requests.get(KLINE_URL.format(symbol, interval), timeout=10)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if "result" not in data or "list" not in data["result"]:
+        async with session.get(url, timeout=10) as r:
+            if r.status != 200:
+                return None
+            return await r.json()
+    except:
+        return None
+
+async def load_kline(symbol, interval):
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_json(session, KLINE_URL.format(symbol, interval))
+        if not data or "result" not in data or "list" not in data["result"]:
             return None
         df = pd.DataFrame(data["result"]["list"])
         df.columns = ["timestamp", "open", "high", "low", "close", "volume", "turnover"]
@@ -25,27 +32,22 @@ def load_kline(symbol, interval):
         df["low"] = df["low"].astype(float)
         df["volume"] = df["volume"].astype(float)
         return df
-    except:
-        return None
 
-def load_orderbook(symbol):
-    try:
-        r = requests.get(ORDERBOOK_URL.format(symbol), timeout=10)
-        if r.status_code != 200:
+async def load_orderbook(symbol):
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_json(session, ORDERBOOK_URL.format(symbol))
+        if not data or "result" not in data:
             return None, None, None
-        data = r.json()
         bids = np.array([[float(p), float(q)] for p, q in data["result"]["b"]])
         asks = np.array([[float(p), float(q)] for p, q in data["result"]["a"]])
         bid_liq = bids[:10, 1].sum()
         ask_liq = asks[:10, 1].sum()
         imbalance = (bid_liq - ask_liq) / (bid_liq + ask_liq + 1e-9)
         return bid_liq, ask_liq, imbalance
-    except:
-        return None, None, None
 
-# ======================
-# 2. Индикаторы
-# ======================
+# ----------------------
+# Индикаторы
+# ----------------------
 def stoch_rsi(df, period=14):
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
@@ -65,10 +67,10 @@ def mfi(df, period=14):
     mfi_val = 100 * positive_flow.rolling(period).sum() / (positive_flow.rolling(period).sum() + negative_flow.rolling(period).sum() + 1e-9)
     return mfi_val
 
-# ======================
-# 3. Анализ разворота
-# ======================
-def analyze(df, bid_liq, ask_liq):
+# ----------------------
+# Анализ разворота
+# ----------------------
+def analyze(df, bid_liq, ask_liq, df_5min=None):
     if len(df) < 15:
         return None
 
@@ -81,33 +83,40 @@ def analyze(df, bid_liq, ask_liq):
     mfi_val = mfi(df).iloc[-1]
 
     reversal_score = 0
+    reasons = []
 
-    # объём — спад после пампа
     if 500_000 <= last_vol <= 5_000_000 and last_vol < avg_vol:
         reversal_score += 1
+        reasons.append("Спад объёма после пампа")
 
-    # перекупленность
     if stoch > 0.8 or mfi_val > 80:
         reversal_score += 1
+        reasons.append("Перекупленность (Stoch RSI или MFI)")
 
-    # цена начала падать
     if last_close < prev_close:
         reversal_score += 1
+        reasons.append("Цена начала падать")
 
-    # дисбаланс стакана
     imbalance = (bid_liq - ask_liq) / (bid_liq + ask_liq + 1e-9)
     if imbalance < -0.2:
         reversal_score += 1
+        reasons.append("Дисбаланс стакана (ask > bid)")
+
+    if df_5min is not None and len(df_5min) >= 20:
+        support = df_5min["low"].rolling(20).min().iloc[-1]
+        if last_close < support:
+            reversal_score += 1
+            reasons.append(f"Пробой поддержки {support:.6f} на 5м таймфрейме")
 
     signal = "SHORT" if reversal_score >= 3 else "HOLD"
-    strength = min(100, reversal_score * 25)
+    strength = min(100, reversal_score * 20)
 
-    return {"signal": signal, "strength": strength}
+    return {"signal": signal, "strength": strength, "reasons": reasons}
 
-# ======================
-# 4. Логирование
-# ======================
+# ----------------------
+# Логирование
+# ----------------------
 def log_signal(symbol, price, result, file="signals_log.csv"):
     with open(file, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([datetime.now(), symbol, price, result["signal"], result["strength"]])
+        writer.writerow([datetime.now(), symbol, price, result["signal"], result["strength"], "; ".join(result.get("reasons", []))])
