@@ -1,180 +1,117 @@
-import aiohttp
-import csv
-import pandas as pd
-import numpy as np
-from datetime import datetime
+import asyncio
+from datetime import datetime, timedelta
+from loader import bot, CHAT_ID
+from utils import load_kline, load_orderbook, analyze, log_signal, load_funding_and_oi
 
-# ===== Bybit Futures =====
-KLINE_URL = "https://api.bybit.com/v5/market/kline?category=linear&symbol={}&interval={}"
-ORDERBOOK_URL = "https://api.bybit.com/v5/market/orderbook?category=linear&symbol={}&limit=50"
-FUNDING_URL = "https://api.bybit.com/v5/market/funding/history?symbol={}&limit=1"
-OI_URL = "https://api.bybit.com/v5/market/open-interest?category=linear&symbol={}&interval=5min&limit=2"
+SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+INTERVALS = ["1", "5", "15"]
+MIN_GROWTH = 15  # минимальный рост за 24 часа для сигнала SHORT
 
 # ----------------------
-# HTTP
+# Отправка сигнала
 # ----------------------
-async def fetch_json(session, url):
-    try:
-        async with session.get(url, timeout=10) as r:
-            if r.status != 200:
-                return None
-            return await r.json()
-    except Exception:
-        return None
+def send_signal(symbol, price, result, interval):
+    reasons_text = "\n".join([f"- {r}" for r in result.get("reasons", [])])
 
-# ----------------------
-# Market data
-# ----------------------
-async def load_kline(symbol, interval):
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_json(session, KLINE_URL.format(symbol, interval))
-        if not data or "result" not in data or "list" not in data["result"]:
-            return None
+    risk = result.get("risk_level", "N/A")
+    funding = result.get("funding")
+    oi = result.get("oi_change")
 
-        df = pd.DataFrame(data["result"]["list"])
-        df.columns = ["ts", "open", "high", "low", "close", "volume", "turnover"]
+    extra = ""
+    if funding is not None:
+        extra += f"\nFunding: `{funding:+.4f}%`"
+    if oi is not None:
+        extra += f"\nOI change: `{oi:+.2f}%`"
 
-        for c in ["open", "high", "low", "close", "volume"]:
-            df[c] = df[c].astype(float)
-
-        return df
-
-async def load_orderbook(symbol):
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_json(session, ORDERBOOK_URL.format(symbol))
-        if not data or "result" not in data:
-            return None, None, None
-
-        bids = np.array([[float(p), float(q)] for p, q in data["result"]["b"]])
-        asks = np.array([[float(p), float(q)] for p, q in data["result"]["a"]])
-
-        bid_liq = bids[:10, 1].sum()
-        ask_liq = asks[:10, 1].sum()
-        imbalance = (bid_liq - ask_liq) / (bid_liq + ask_liq + 1e-9)
-
-        return bid_liq, ask_liq, imbalance
-
-# ----------------------
-# Funding / OI (ASYNC, SAFE)
-# ----------------------
-async def load_funding_and_oi(symbol):
-    async with aiohttp.ClientSession() as session:
-        funding, oi_change = None, None
-
-        funding_data = await fetch_json(session, FUNDING_URL.format(symbol))
-        oi_data = await fetch_json(session, OI_URL.format(symbol))
-
-        try:
-            funding = float(funding_data["result"]["list"][0]["fundingRate"]) * 100
-        except Exception:
-            pass
-
-        try:
-            oi_list = oi_data["result"]["list"]
-            if len(oi_list) >= 2:
-                old = float(oi_list[0]["openInterest"])
-                new = float(oi_list[1]["openInterest"])
-                oi_change = (new - old) / old * 100
-        except Exception:
-            pass
-
-        return funding, oi_change
-
-# ----------------------
-# Indicators
-# ----------------------
-def stoch_rsi(df, period=14):
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    rs = gain.rolling(period).mean() / (loss.rolling(period).mean() + 1e-9)
-    rsi = 100 - (100 / (1 + rs))
-
-    return (rsi - rsi.rolling(period).min()) / (
-        rsi.rolling(period).max() - rsi.rolling(period).min() + 1e-9
+    text = (
+        f"📉 *Futures сигнал {symbol} ({interval}m)*\n"
+        f"Цена: `{price}`\n"
+        f"Сигнал: *{result['signal']}*\n"
+        f"Сила: {result['strength']}%\n"
+        f"Риск: *{risk}*\n"
+        f"{extra}\n\n"
+        f"*Факторы:*\n{reasons_text}"
     )
 
-def mfi(df, period=14):
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    mf = tp * df["volume"]
+    bot.send_message(CHAT_ID, text, parse_mode="Markdown")
 
-    pos = mf.where(df["close"] > df["close"].shift(1), 0)
-    neg = mf.where(df["close"] < df["close"].shift(1), 0)
-
-    return 100 * pos.rolling(period).sum() / (
-        pos.rolling(period).sum() + neg.rolling(period).sum() + 1e-9
+# ----------------------
+# Команда /start
+# ----------------------
+@bot.message_handler(commands=["start"])
+def send_welcome(message):
+    bot.send_message(
+        message.chat.id,
+        "🤖 Бот ищет SHORT-развороты на Bybit Futures.\n\n"
+        "Дополнительно показывает:\n"
+        "- Risk-score (опасность входа)\n"
+        "- Funding Rate (где толпа)\n"
+        "- Изменение Open Interest\n"
+        "⚠️ Сигналы SHORT активны только если рост за последние 24 часа >= 15%"
     )
 
 # ----------------------
-# Analysis (SYNC, SAFE)
-# ----------------------
-def analyze(df, bid_liq, ask_liq, df_5min=None, funding=None, oi_change=None):
-    if len(df) < 20:
-        return None
+async def process_symbol(symbol, interval):
+    bid_liq, ask_liq, _ = await load_orderbook(symbol)
+    if bid_liq is None:
+        return
 
-    last = df["close"].iloc[-1]
-    prev = df["close"].iloc[-2]
+    df = await load_kline(symbol, interval)
+    if df is None or len(df) < 2:
+        return
 
-    stoch = stoch_rsi(df).iloc[-1]
-    mfi_val = mfi(df).iloc[-1]
+    df_5min = await load_kline(symbol, "5")
 
-    score = 0
-    reasons = []
+    # --- загрузка Funding и OI ---
+    funding, oi_change = await load_funding_and_oi(symbol)
 
-    if stoch > 0.8 or mfi_val > 80:
-        score += 1
-        reasons.append("Перекупленность (Stoch RSI / MFI)")
+    # --- точная проверка роста за 24 часа (по минутным свечам) ---
+    df_1m = await load_kline(symbol, "1")  # 1-мин свечи
+    growth_ok = False
+    if df_1m is not None and len(df_1m) >= 2:
+        now = datetime.utcnow()
+        ts_24h_ago = int((now - timedelta(hours=24)).timestamp() * 1000)  # timestamp в ms
+        df_24h = df_1m[df_1m["ts"].astype(int) >= ts_24h_ago]
 
-    if last < prev:
-        score += 1
-        reasons.append("Начало снижения цены")
+        if not df_24h.empty:
+            close_24h_ago = df_24h["close"].iloc[0]
+            last_close = df["close"].iloc[-1]
+            growth = (last_close - close_24h_ago) / close_24h_ago * 100
+            if growth >= MIN_GROWTH:
+                growth_ok = True
 
-    imbalance = (bid_liq - ask_liq) / (bid_liq + ask_liq + 1e-9)
-    if imbalance < -0.2:
-        score += 1
-        reasons.append("Ask-дисбаланс стакана")
+    # --- анализ сигнала ---
+    result = analyze(df, bid_liq, ask_liq, df_5min=df_5min, funding=funding, oi_change=oi_change)
 
-    if df_5min is not None and len(df_5min) >= 20:
-        support = df_5min["low"].rolling(20).min().iloc[-1]
-        if last < support:
-            score += 1
-            reasons.append("Пробой поддержки 5m")
+    # --- применяем фильтр роста ---
+    if result and result["signal"] == "SHORT" and not growth_ok:
+        result["signal"] = "HOLD"
+        result["reasons"].append(f"Рост < {MIN_GROWTH}% за последние 24ч — сигнал не активен")
 
-    # ----- Risk (INFO ONLY)
-    risk = 0
-    if df["high"].iloc[-1] / df["low"].iloc[-1] > 1.02:
-        risk += 1
-    if stoch > 0.9:
-        risk += 1
-
-    risk_level = ["LOW 🟢", "MEDIUM 🟡", "HIGH 🔴"][min(risk, 2)]
-
-    signal = "SHORT" if score >= 3 else "HOLD"
-
-    return {
-        "signal": signal,
-        "strength": min(100, score * 25),
-        "reasons": reasons,
-        "risk_level": risk_level,
-        "funding": funding,
-        "oi_change": oi_change
-    }
+    price = df["close"].iloc[-1]
+    send_signal(symbol, price, result, interval)
+    log_signal(symbol, price, result)
 
 # ----------------------
-# Logs
+async def main_loop():
+    while True:
+        try:
+            tasks = [
+                process_symbol(symbol, interval)
+                for symbol in SYMBOLS
+                for interval in INTERVALS
+            ]
+            await asyncio.gather(*tasks)
+            await asyncio.sleep(5)
+        except Exception as e:
+            print("Error:", e)
+            await asyncio.sleep(5)
+
 # ----------------------
-def log_signal(symbol, price, result, file="signals_log.csv"):
-    with open(file, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            datetime.now(),
-            symbol,
-            price,
-            result["signal"],
-            result["strength"],
-            result.get("risk_level"),
-            result.get("funding"),
-            result.get("oi_change"),
-            "; ".join(result.get("reasons", []))
-        ])
+def main():
+    loop = asyncio.get_event_loop()
+    loop.create_task(main_loop())
+    bot.infinity_polling()
+
+if __name__ == "__main__":
+    main()
