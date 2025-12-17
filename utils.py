@@ -107,7 +107,7 @@ def mfi(df, period=14):
     )
 
 # ----------------------
-# Analysis (SYNC, SAFE)
+# Analysis (SYNC)
 # ----------------------
 def analyze(df, bid_liq, ask_liq, df_5min=None, funding=None, oi_change=None):
     if len(df) < 20:
@@ -135,7 +135,7 @@ def analyze(df, bid_liq, ask_liq, df_5min=None, funding=None, oi_change=None):
         score += 1
         reasons.append("Ask-дисбаланс стакана")
 
-    # --- критерий пробоя поддержки на 5m удалён ---
+    # --- пробой поддержки на 5m удалён ---
 
     # ----- Risk (INFO ONLY)
     risk = 0
@@ -146,7 +146,7 @@ def analyze(df, bid_liq, ask_liq, df_5min=None, funding=None, oi_change=None):
 
     risk_level = ["LOW 🟢", "MEDIUM 🟡", "HIGH 🔴"][min(risk, 2)]
 
-    signal = "SHORT" if score >= 2 else "HOLD"  # порог теперь по остальным условиям
+    signal = "SHORT" if score >= 2 else "HOLD"
 
     return {
         "signal": signal,
