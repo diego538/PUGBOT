@@ -1,9 +1,11 @@
 import asyncio
+from datetime import datetime, timedelta
 from loader import bot, CHAT_ID
-from utils import load_kline, load_orderbook, analyze, log_signal
+from utils import load_kline, load_orderbook, analyze, log_signal, load_funding_and_oi
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 INTERVALS = ["1", "5", "15"]
+MIN_GROWTH = 15  # минимальный рост за 24 часа для сигнала SHORT
 
 # ----------------------
 # Отправка сигнала
@@ -44,8 +46,8 @@ def send_welcome(message):
         "Дополнительно показывает:\n"
         "- Risk-score (опасность входа)\n"
         "- Funding Rate (где толпа)\n"
-        "- Изменение Open Interest\n\n"
-        "⚠️ Эти параметры не фильтруют сигнал, а помогают принять решение."
+        "- Изменение Open Interest\n"
+        "⚠️ Сигналы SHORT активны только если рост за последние 24 часа >= 15%"
     )
 
 # ----------------------
@@ -55,37 +57,28 @@ async def process_symbol(symbol, interval):
         return
 
     df = await load_kline(symbol, interval)
-    if df is None:
+    if df is None or len(df) < 2:
         return
 
     df_5min = await load_kline(symbol, "5")
 
-    result = analyze(df, bid_liq, ask_liq, df_5min=df_5min, symbol=symbol)
-    if not result or result["signal"] == "HOLD":
-        return
+    # --- загрузка Funding и OI ---
+    funding, oi_change = await load_funding_and_oi(symbol)
 
-    price = df["close"].iloc[-1]
-    send_signal(symbol, price, result, interval)
-    log_signal(symbol, price, result)
+    # --- точная проверка роста за 24 часа (по минутным свечам) ---
+    df_1m = await load_kline(symbol, "1")  # 1-мин свечи
+    growth_ok = False
+    if df_1m is not None and len(df_1m) >= 2:
+        now = datetime.utcnow()
+        ts_24h_ago = int((now - timedelta(hours=24)).timestamp() * 1000)  # timestamp в ms
+        df_24h = df_1m[df_1m["ts"].astype(int) >= ts_24h_ago]
 
-async def main_loop():
-    while True:
-        try:
-            tasks = [
-                process_symbol(symbol, interval)
-                for symbol in SYMBOLS
-                for interval in INTERVALS
-            ]
-            await asyncio.gather(*tasks)
-            await asyncio.sleep(5)
-        except Exception as e:
-            print("Error:", e)
-            await asyncio.sleep(5)
+        if not df_24h.empty:
+            close_24h_ago = df_24h["close"].iloc[0]
+            last_close = df["close"].iloc[-1]
+            growth = (last_close - close_24h_ago) / close_24h_ago * 100
+            if growth >= MIN_GROWTH:
+                growth_ok = True
 
-def main():
-    loop = asyncio.get_event_loop()
-    loop.create_task(main_loop())
-    bot.infinity_polling()
-
-if __name__ == "__main__":
-    main()
+    # --- анализ сигнала ---
+    result = analyze(df, bid_liq, ask_liq, df_5min=df_5min, funding=funding, oi
