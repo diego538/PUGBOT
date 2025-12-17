@@ -5,9 +5,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не найден в переменных окружения")
+    raise ValueError("❌ BOT_TOKEN не найден в переменных окружения BotHost!")
 
 if not CHAT_ID:
-    raise ValueError("❌ CHAT_ID не найден в переменных окружения")
+    raise ValueError("❌ CHAT_ID не найден в переменных окружения BotHost!")
 
 bot = telebot.TeleBot(BOT_TOKEN)
