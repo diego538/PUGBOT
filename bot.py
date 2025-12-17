@@ -10,13 +10,27 @@ INTERVALS = ["1", "5", "15"]
 # ----------------------
 def send_signal(symbol, price, result, interval):
     reasons_text = "\n".join([f"- {r}" for r in result.get("reasons", [])])
+
+    risk = result.get("risk_level", "N/A")
+    funding = result.get("funding")
+    oi = result.get("oi_change")
+
+    extra = ""
+    if funding is not None:
+        extra += f"\nFunding: `{funding:+.4f}%`"
+    if oi is not None:
+        extra += f"\nOI change: `{oi:+.2f}%`"
+
     text = (
-        f"📉 *Futures сигнал по {symbol} ({interval}m)*\n"
+        f"📉 *Futures сигнал {symbol} ({interval}m)*\n"
         f"Цена: `{price}`\n"
         f"Сигнал: *{result['signal']}*\n"
-        f"Вероятность: {result['strength']}%\n\n"
+        f"Сила: {result['strength']}%\n"
+        f"Риск: *{risk}*\n"
+        f"{extra}\n\n"
         f"*Факторы:*\n{reasons_text}"
     )
+
     bot.send_message(CHAT_ID, text, parse_mode="Markdown")
 
 # ----------------------
@@ -24,22 +38,19 @@ def send_signal(symbol, price, result, interval):
 # ----------------------
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
-    text = (
-        "🤖 Я бот для поиска SHORT-разворотов на Bybit Futures.\n\n"
-        "Я анализирую:\n"
-        "- Перекупленность (Stoch RSI / MFI)\n"
-        "- Начало снижения цены\n"
-        "- Дисбаланс стакана\n"
-        "- Пробой поддержки на 5m\n\n"
-        "Работаю на фьючерсах (USDT-perpetual)."
+    bot.send_message(
+        message.chat.id,
+        "🤖 Бот ищет SHORT-развороты на Bybit Futures.\n\n"
+        "Дополнительно показывает:\n"
+        "- Risk-score (опасность входа)\n"
+        "- Funding Rate (где толпа)\n"
+        "- Изменение Open Interest\n\n"
+        "⚠️ Эти параметры не фильтруют сигнал, а помогают принять решение."
     )
-    bot.send_message(message.chat.id, text)
 
 # ----------------------
-# Анализ одного инструмента
-# ----------------------
 async def process_symbol(symbol, interval):
-    bid_liq, ask_liq, imbalance = await load_orderbook(symbol)
+    bid_liq, ask_liq, _ = await load_orderbook(symbol)
     if bid_liq is None:
         return
 
@@ -49,7 +60,7 @@ async def process_symbol(symbol, interval):
 
     df_5min = await load_kline(symbol, "5")
 
-    result = analyze(df, bid_liq, ask_liq, df_5min=df_5min)
+    result = analyze(df, bid_liq, ask_liq, df_5min=df_5min, symbol=symbol)
     if not result or result["signal"] == "HOLD":
         return
 
@@ -57,9 +68,6 @@ async def process_symbol(symbol, interval):
     send_signal(symbol, price, result, interval)
     log_signal(symbol, price, result)
 
-# ----------------------
-# Главный цикл
-# ----------------------
 async def main_loop():
     while True:
         try:
