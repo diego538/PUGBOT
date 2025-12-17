@@ -4,12 +4,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-# Bybit Futures (USDT Perpetual)
 KLINE_URL = "https://api.bybit.com/v5/market/kline?category=linear&symbol={}&interval={}"
 ORDERBOOK_URL = "https://api.bybit.com/v5/market/orderbook?category=linear&symbol={}&limit=50"
+FUNDING_URL = "https://api.bybit.com/v5/market/funding/history?symbol={}&limit=1"
+OI_URL = "https://api.bybit.com/v5/market/open-interest?category=linear&symbol={}&interval=5min"
 
-# ----------------------
-# HTTP
 # ----------------------
 async def fetch_json(session, url):
     try:
@@ -20,18 +19,17 @@ async def fetch_json(session, url):
     except Exception:
         return None
 
+# ----------------------
 async def load_kline(symbol, interval):
     async with aiohttp.ClientSession() as session:
         data = await fetch_json(session, KLINE_URL.format(symbol, interval))
-        if not data or "result" not in data or "list" not in data["result"]:
+        if not data or "result" not in data:
             return None
 
         df = pd.DataFrame(data["result"]["list"])
-        df.columns = ["timestamp", "open", "high", "low", "close", "volume", "turnover"]
-
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = df[col].astype(float)
-
+        df.columns = ["ts", "open", "high", "low", "close", "volume", "turnover"]
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = df[c].astype(float)
         return df
 
 async def load_orderbook(symbol):
@@ -50,19 +48,37 @@ async def load_orderbook(symbol):
         return bid_liq, ask_liq, imbalance
 
 # ----------------------
-# Индикаторы
+async def load_funding_and_oi(symbol):
+    async with aiohttp.ClientSession() as session:
+        funding_data = await fetch_json(session, FUNDING_URL.format(symbol))
+        oi_data = await fetch_json(session, OI_URL.format(symbol))
+
+        funding = None
+        oi_change = None
+
+        try:
+            funding = float(funding_data["result"]["list"][0]["fundingRate"]) * 100
+        except Exception:
+            pass
+
+        try:
+            oi_list = oi_data["result"]["list"]
+            if len(oi_list) >= 2:
+                old = float(oi_list[-2]["openInterest"])
+                new = float(oi_list[-1]["openInterest"])
+                oi_change = (new - old) / old * 100
+        except Exception:
+            pass
+
+        return funding, oi_change
+
 # ----------------------
 def stoch_rsi(df, period=14):
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-
-    rs = avg_gain / (avg_loss + 1e-9)
+    rs = gain.rolling(period).mean() / (loss.rolling(period).mean() + 1e-9)
     rsi = 100 - (100 / (1 + rs))
-
     return (rsi - rsi.rolling(period).min()) / (
         rsi.rolling(period).max() - rsi.rolling(period).min() + 1e-9
     )
@@ -70,23 +86,19 @@ def stoch_rsi(df, period=14):
 def mfi(df, period=14):
     tp = (df["high"] + df["low"] + df["close"]) / 3
     mf = tp * df["volume"]
-
     pos = mf.where(df["close"] > df["close"].shift(1), 0)
     neg = mf.where(df["close"] < df["close"].shift(1), 0)
-
     return 100 * pos.rolling(period).sum() / (
         pos.rolling(period).sum() + neg.rolling(period).sum() + 1e-9
     )
 
 # ----------------------
-# Анализ
-# ----------------------
-def analyze(df, bid_liq, ask_liq, df_5min=None):
+def analyze(df, bid_liq, ask_liq, df_5min=None, symbol=None):
     if len(df) < 20:
         return None
 
-    last_close = df["close"].iloc[-1]
-    prev_close = df["close"].iloc[-2]
+    last = df["close"].iloc[-1]
+    prev = df["close"].iloc[-2]
 
     stoch = stoch_rsi(df).iloc[-1]
     mfi_val = mfi(df).iloc[-1]
@@ -96,43 +108,59 @@ def analyze(df, bid_liq, ask_liq, df_5min=None):
 
     if stoch > 0.8 or mfi_val > 80:
         score += 1
-        reasons.append("Перекупленность (Stoch RSI / MFI)")
+        reasons.append("Перекупленность")
 
-    if last_close < prev_close:
+    if last < prev:
         score += 1
         reasons.append("Начало снижения цены")
 
     imbalance = (bid_liq - ask_liq) / (bid_liq + ask_liq + 1e-9)
     if imbalance < -0.2:
         score += 1
-        reasons.append("Дисбаланс стакана (ask > bid)")
+        reasons.append("Ask-дисбаланс")
 
-    if df_5min is not None and len(df_5min) >= 20:
+    if df_5min is not None:
         support = df_5min["low"].rolling(20).min().iloc[-1]
-        if last_close < support:
+        if last < support:
             score += 1
-            reasons.append("Пробой поддержки на 5m")
+            reasons.append("Пробой поддержки 5m")
 
     signal = "SHORT" if score >= 3 else "HOLD"
-    strength = min(100, score * 25)
+
+    # ---- Risk score (инфо)
+    risk = 0
+    if df["high"].iloc[-1] / df["low"].iloc[-1] > 1.02:
+        risk += 1
+    if stoch > 0.9:
+        risk += 1
+
+    risk_level = ["LOW 🟢", "MEDIUM 🟡", "HIGH 🔴"][min(risk, 2)]
+
+    # ---- Funding / OI (инфо)
+    funding, oi_change = None, None
+    if symbol:
+        funding, oi_change = asyncio.run(load_funding_and_oi(symbol))
 
     return {
         "signal": signal,
-        "strength": strength,
-        "reasons": reasons
+        "strength": min(100, score * 25),
+        "reasons": reasons,
+        "risk_level": risk_level,
+        "funding": funding,
+        "oi_change": oi_change
     }
 
 # ----------------------
-# Логи
-# ----------------------
 def log_signal(symbol, price, result, file="signals_log.csv"):
     with open(file, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
+        csv.writer(f).writerow([
             datetime.now(),
             symbol,
             price,
             result["signal"],
             result["strength"],
+            result.get("risk_level"),
+            result.get("funding"),
+            result.get("oi_change"),
             "; ".join(result.get("reasons", []))
         ])
