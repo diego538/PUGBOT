@@ -40,15 +40,30 @@ def send_signal(symbol, price, result, interval):
 # ----------------------
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
-    bot.send_message(
-        message.chat.id,
-        "🤖 Бот ищет SHORT-развороты на Bybit Futures.\n\n"
-        "Дополнительно показывает:\n"
-        "- Risk-score (опасность входа)\n"
-        "- Funding Rate (где толпа)\n"
-        "- Изменение Open Interest\n"
-        "⚠️ Сигналы SHORT активны только если рост за последние 24 часа >= 15%"
+    explanation = (
+        "🤖 Привет! Я бот для поиска SHORT-сигналов на Bybit Futures.\n\n"
+        "Вот что я делаю:\n"
+        "1️⃣ Загружаю данные по выбранным монетам:\n"
+        "   - Книгу ордеров (bid/ask) для оценки дисбаланса стакана\n"
+        "   - Свечи разных таймфреймов (1m, 5m, 15m) для анализа цены и объёмов\n"
+        "2️⃣ Анализирую сигналы SHORT по следующим условиям:\n"
+        "   - Перекупленность (Stoch RSI или MFI > 80)\n"
+        "   - Начало снижения цены\n"
+        "   - Ask-дисбаланс стакана\n"
+        "   ⚠️ Сигнал SHORT выдаётся только если рост цены за последние 24 часа ≥ 15%\n"
+        "3️⃣ Вычисляю силу сигнала (strength) и Risk-score (низкий/средний/высокий)\n"
+        "4️⃣ Подтягиваю информационные показатели:\n"
+        "   - Funding Rate (где толпа)\n"
+        "   - Изменение Open Interest (OI) за последние свечи\n"
+        "5️⃣ Отправляю Telegram-сообщение с:\n"
+        "   - Символом и таймфреймом\n"
+        "   - Текущей ценой\n"
+        "   - Сигналом SHORT или HOLD\n"
+        "   - Силой сигнала, Risk-score, Funding, OI\n"
+        "   - Причинами сигнала (факторы)\n\n"
+        "Все сигналы логируются в CSV-файл для анализа."
     )
+    bot.send_message(message.chat.id, explanation)
 
 # ----------------------
 async def process_symbol(symbol, interval):
@@ -81,4 +96,38 @@ async def process_symbol(symbol, interval):
                 growth_ok = True
 
     # --- анализ сигнала ---
-    result = analyze(df, bid_liq, ask_liq, df_5min=df_5min, funding=funding, oi
+    result = analyze(df, bid_liq, ask_liq, df_5min=df_5min, funding=funding, oi_change=oi_change)
+
+    # --- применяем фильтр роста ---
+    if result and result["signal"] == "SHORT" and not growth_ok:
+        result["signal"] = "HOLD"
+        result["reasons"].append(f"Рост < {MIN_GROWTH}% за последние 24ч — сигнал не активен")
+
+    price = df["close"].iloc[-1]
+    send_signal(symbol, price, result, interval)
+    log_signal(symbol, price, result)
+
+# ----------------------
+async def main_loop():
+    while True:
+        try:
+            tasks = [
+                process_symbol(symbol, interval)
+                for symbol in SYMBOLS
+                for interval in INTERVALS
+            ]
+            await asyncio.gather(*tasks)
+            await asyncio.sleep(5)
+        except Exception as e:
+            print("Error:", e)
+            await asyncio.sleep(5)
+
+# ----------------------
+def main():
+    loop = asyncio.get_event_loop()
+    loop.create_task(main_loop())
+    bot.infinity_polling()
+
+if __name__ == "__main__":
+    main()
+
