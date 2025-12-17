@@ -1,15 +1,15 @@
 import aiohttp
-import asyncio
 import csv
 import pandas as pd
 import numpy as np
 from datetime import datetime
 
-KLINE_URL = "https://api.bybit.com/v5/market/kline?category=spot&symbol={}&interval={}"
-ORDERBOOK_URL = "https://api.bybit.com/v5/market/orderbook?category=spot&symbol={}&limit=50"
+# Bybit Futures (USDT Perpetual)
+KLINE_URL = "https://api.bybit.com/v5/market/kline?category=linear&symbol={}&interval={}"
+ORDERBOOK_URL = "https://api.bybit.com/v5/market/orderbook?category=linear&symbol={}&limit=50"
 
 # ----------------------
-# Асинхронная загрузка данных
+# HTTP
 # ----------------------
 async def fetch_json(session, url):
     try:
@@ -17,7 +17,7 @@ async def fetch_json(session, url):
             if r.status != 200:
                 return None
             return await r.json()
-    except:
+    except Exception:
         return None
 
 async def load_kline(symbol, interval):
@@ -25,12 +25,13 @@ async def load_kline(symbol, interval):
         data = await fetch_json(session, KLINE_URL.format(symbol, interval))
         if not data or "result" not in data or "list" not in data["result"]:
             return None
+
         df = pd.DataFrame(data["result"]["list"])
         df.columns = ["timestamp", "open", "high", "low", "close", "volume", "turnover"]
-        df["close"] = df["close"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
-        df["volume"] = df["volume"].astype(float)
+
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = df[col].astype(float)
+
         return df
 
 async def load_orderbook(symbol):
@@ -38,11 +39,14 @@ async def load_orderbook(symbol):
         data = await fetch_json(session, ORDERBOOK_URL.format(symbol))
         if not data or "result" not in data:
             return None, None, None
+
         bids = np.array([[float(p), float(q)] for p, q in data["result"]["b"]])
         asks = np.array([[float(p), float(q)] for p, q in data["result"]["a"]])
+
         bid_liq = bids[:10, 1].sum()
         ask_liq = asks[:10, 1].sum()
         imbalance = (bid_liq - ask_liq) / (bid_liq + ask_liq + 1e-9)
+
         return bid_liq, ask_liq, imbalance
 
 # ----------------------
@@ -52,71 +56,83 @@ def stoch_rsi(df, period=14):
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
+
     avg_gain = gain.rolling(period).mean()
     avg_loss = loss.rolling(period).mean()
+
     rs = avg_gain / (avg_loss + 1e-9)
     rsi = 100 - (100 / (1 + rs))
-    stoch = (rsi - rsi.rolling(period).min()) / (rsi.rolling(period).max() - rsi.rolling(period).min() + 1e-9)
-    return stoch
+
+    return (rsi - rsi.rolling(period).min()) / (
+        rsi.rolling(period).max() - rsi.rolling(period).min() + 1e-9
+    )
 
 def mfi(df, period=14):
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    money_flow = typical_price * df["volume"]
-    positive_flow = money_flow.where(df["close"] > df["close"].shift(1), 0)
-    negative_flow = money_flow.where(df["close"] < df["close"].shift(1), 0)
-    mfi_val = 100 * positive_flow.rolling(period).sum() / (positive_flow.rolling(period).sum() + negative_flow.rolling(period).sum() + 1e-9)
-    return mfi_val
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    mf = tp * df["volume"]
+
+    pos = mf.where(df["close"] > df["close"].shift(1), 0)
+    neg = mf.where(df["close"] < df["close"].shift(1), 0)
+
+    return 100 * pos.rolling(period).sum() / (
+        pos.rolling(period).sum() + neg.rolling(period).sum() + 1e-9
+    )
 
 # ----------------------
-# Анализ разворота
+# Анализ
 # ----------------------
 def analyze(df, bid_liq, ask_liq, df_5min=None):
-    if len(df) < 15:
+    if len(df) < 20:
         return None
 
     last_close = df["close"].iloc[-1]
     prev_close = df["close"].iloc[-2]
-    last_vol = df["volume"].iloc[-1]
-    avg_vol = df["volume"].iloc[-15:-1].mean()
 
     stoch = stoch_rsi(df).iloc[-1]
     mfi_val = mfi(df).iloc[-1]
 
-    reversal_score = 0
+    score = 0
     reasons = []
 
-    if 500_000 <= last_vol <= 5_000_000 and last_vol < avg_vol:
-        reversal_score += 1
-        reasons.append("Спад объёма после пампа")
-
     if stoch > 0.8 or mfi_val > 80:
-        reversal_score += 1
-        reasons.append("Перекупленность (Stoch RSI или MFI)")
+        score += 1
+        reasons.append("Перекупленность (Stoch RSI / MFI)")
 
     if last_close < prev_close:
-        reversal_score += 1
-        reasons.append("Цена начала падать")
+        score += 1
+        reasons.append("Начало снижения цены")
 
     imbalance = (bid_liq - ask_liq) / (bid_liq + ask_liq + 1e-9)
     if imbalance < -0.2:
-        reversal_score += 1
+        score += 1
         reasons.append("Дисбаланс стакана (ask > bid)")
 
     if df_5min is not None and len(df_5min) >= 20:
         support = df_5min["low"].rolling(20).min().iloc[-1]
         if last_close < support:
-            reversal_score += 1
-            reasons.append(f"Пробой поддержки {support:.6f} на 5м таймфрейме")
+            score += 1
+            reasons.append("Пробой поддержки на 5m")
 
-    signal = "SHORT" if reversal_score >= 3 else "HOLD"
-    strength = min(100, reversal_score * 20)
+    signal = "SHORT" if score >= 3 else "HOLD"
+    strength = min(100, score * 25)
 
-    return {"signal": signal, "strength": strength, "reasons": reasons}
+    return {
+        "signal": signal,
+        "strength": strength,
+        "reasons": reasons
+    }
 
 # ----------------------
-# Логирование
+# Логи
 # ----------------------
 def log_signal(symbol, price, result, file="signals_log.csv"):
     with open(file, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([datetime.now(), symbol, price, result["signal"], result["strength"], "; ".join(result.get("reasons", []))])
+        writer.writerow([
+            datetime.now(),
+            symbol,
+            price,
+            result["signal"],
+            result["strength"],
+            "; ".join(result.get("reasons", []))
+        ])
